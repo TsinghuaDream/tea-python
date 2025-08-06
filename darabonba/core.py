@@ -9,7 +9,7 @@ import re
 import certifi
 import json
 from requests import status_codes, adapters, PreparedRequest
-from typing import Any, Dict, Optional
+from typing import Generator, AsyncGenerator, Any, Dict, Optional
 from enum import Enum
 from urllib.parse import urlencode, urlparse
 from requests import status_codes, adapters, PreparedRequest, Session
@@ -310,6 +310,308 @@ class DaraCore:
         response.body = resp.content
         response.response = resp
         return response
+
+    @staticmethod
+    def do_sse_action(
+            request: DaraRequest,
+            runtime_option=None
+    ):
+        url = DaraCore.compose_url(request)
+
+        runtime_option = runtime_option or {}
+
+        verify = not runtime_option.get('ignoreSSL', False)
+        if verify:
+            verify = runtime_option.get('ca', True) if runtime_option.get('ca', True) is not None else True
+        cert = runtime_option.get('cert', None)
+
+        connect_timeout = runtime_option.get('connectTimeout')
+        connect_timeout = connect_timeout if connect_timeout else DEFAULT_CONNECT_TIMEOUT
+
+        read_timeout = runtime_option.get('readTimeout')
+        read_timeout = read_timeout if read_timeout else DEFAULT_READ_TIMEOUT
+
+        timeout = (int(connect_timeout) / 1000, int(read_timeout) / 1000)
+
+        end_of_field = re.compile(b'\r\n\r\n|\r\r|\n\n')
+        
+        if isinstance(request.body, str):
+            request.body = request.body.encode('utf-8')
+
+        p = PreparedRequest()
+        p.prepare(
+            method=request.method.upper(),
+            url=url,
+            data=request.body,
+            headers=request.headers,
+        )
+
+        proxies = {}
+        http_proxy = runtime_option.get('httpProxy')
+        https_proxy = runtime_option.get('httpsProxy')
+        no_proxy = runtime_option.get('noProxy')
+
+        if not http_proxy:
+            http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+        if not https_proxy:
+            https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+
+        if http_proxy:
+            proxies['http'] = http_proxy
+        if https_proxy:
+            proxies['https'] = https_proxy
+        if no_proxy:
+            proxies['no_proxy'] = no_proxy
+
+        adapter = DaraCore.get_adapter(request.protocol)
+        try:
+            resp = adapter.send(
+                p,
+                proxies=proxies,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                stream=True
+            )
+        except IOError as e:
+            raise RetryError(str(e))
+
+        debug = runtime_option.get('debug') or os.getenv('DEBUG')
+        if debug and debug.lower() == 'sdk':
+            DaraCore._do_http_debug(p, resp)
+
+        response = DaraResponse()
+        response.status_message = resp.reason
+        response.status_code = resp.status_code
+        response.headers = {k.lower(): v for k, v in resp.headers.items()}
+        response.response = resp
+        data = b''
+        for chunk in resp.iter_content():
+            match = re.search(end_of_field, chunk)
+            if match:
+                items = re.split(end_of_field, chunk)
+                for index, item in enumerate(items):
+                    data += item
+                    if index != len(items) - 1:
+                        yield {'response': response, 'stream': data}
+                        data = b''
+            else:
+                data += chunk
+        if data:
+            yield {'response': response, 'stream': data}
+
+    @staticmethod
+    async def async_do_sse_action(
+            request: DaraRequest,
+            runtime_option=None
+    ) -> AsyncGenerator[DaraResponse, None]:
+        runtime_option = runtime_option or {}
+
+        url = DaraCore.compose_url(request)
+        verify = not runtime_option.get('ignoreSSL', False)
+        tls_min_version = runtime_option.get('tlsMinVersion')
+        if isinstance(tls_min_version, Enum):
+            tls_min_version = tls_min_version.value
+
+        timeout = runtime_option.get('timeout')
+        connect_timeout = runtime_option.get('connectTimeout') or timeout or DEFAULT_CONNECT_TIMEOUT
+        read_timeout = runtime_option.get('readTimeout') or timeout or DEFAULT_READ_TIMEOUT
+
+        connect_timeout, read_timeout = (int(connect_timeout) / 1000, int(read_timeout) / 1000)
+
+        proxy = None
+        if request.protocol.upper() == 'HTTP':
+            proxy = runtime_option.get('httpProxy')
+            if not proxy:
+                proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+        elif request.protocol.upper() == 'HTTPS':
+            proxy = runtime_option.get('httpsProxy')
+            if not proxy:
+                proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+
+        connector = None
+        ca_cert = certifi.where()
+        if ca_cert and request.protocol.upper() == 'HTTPS':
+            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ssl_context = DaraCore._set_tls_minimum_version(ssl_context, tls_min_version)
+            ssl_context.load_verify_locations(ca_cert)
+            connector = aiohttp.TCPConnector(
+                ssl=ssl_context,
+            )
+        else:
+            verify = False
+
+        timeout = aiohttp.ClientTimeout(
+            sock_read=read_timeout,
+            sock_connect=connect_timeout
+        )
+        
+        end_of_field = re.compile(b'\r\n\r\n|\r\r|\n\n')
+        
+        async with aiohttp.ClientSession(connector=connector) as s:
+            body = b''
+            if isinstance(request.body, BaseStream):
+                for content in request.body:
+                    body += content
+            elif isinstance(request.body, str):
+                body = request.body.encode('utf-8')
+            else:
+                body = request.body
+                
+            try:
+                async with s.request(request.method, url,
+                                    data=body,
+                                    headers=request.headers,
+                                    ssl=verify,
+                                    proxy=proxy,
+                                    timeout=timeout) as response:
+                    
+                    base_resp = DaraResponse()
+                    base_resp.headers = {k.lower(): v for k, v in response.headers.items()}
+                    base_resp.status_code = response.status
+                    base_resp.status_message = response.reason
+                    base_resp.response = response
+                    
+                    data = b''
+                    async for chunk in response.content.iter_any():
+                        match = re.search(end_of_field, chunk)
+                        if match:
+                            items = re.split(end_of_field, chunk)
+                            for index, item in enumerate(items):
+                                data += item
+                                if index != len(items) - 1:
+                                    event_resp = DaraResponse()
+                                    event_resp.status_code = base_resp.status_code
+                                    event_resp.headers = base_resp.headers
+                                    event_resp.status_message = base_resp.status_message
+                                    event_resp.response = base_resp.response
+                                    event_resp.body = data
+                                    yield event_resp
+                                    data = b''
+                        else:
+                            data += chunk
+                    
+                    if data:
+                        event_resp = DaraResponse()
+                        event_resp.status_code = base_resp.status_code
+                        event_resp.headers = base_resp.headers
+                        event_resp.status_message = base_resp.status_message
+                        event_resp.response = base_resp.response
+                        event_resp.body = data
+                        yield event_resp
+                        
+            except IOError as e:
+                raise RetryError(str(e))
+
+    @staticmethod
+    def do_sse_action(
+            request: DaraRequest,
+            runtime_option=None
+    ) -> Generator[DaraResponse, None, None]:
+        url = DaraCore.compose_url(request)
+
+        runtime_option = runtime_option or {}
+
+        verify = not runtime_option.get('ignoreSSL', False)
+        tls_min_version = runtime_option.get('tlsMinVersion')
+        if isinstance(tls_min_version, Enum):
+            tls_min_version = tls_min_version.value
+
+        if verify:
+            verify = runtime_option.get('ca', True) if runtime_option.get('ca', True) is not None else True
+        cert = runtime_option.get('cert', None)
+
+        timeout = runtime_option.get('timeout')
+        connect_timeout = runtime_option.get('connectTimeout') or timeout or DEFAULT_CONNECT_TIMEOUT
+        read_timeout = runtime_option.get('readTimeout') or timeout or DEFAULT_READ_TIMEOUT
+
+        timeout = (int(connect_timeout) / 1000, int(read_timeout) / 1000)
+
+        if isinstance(request.body, str):
+            request.body = request.body.encode('utf-8')
+
+        p = PreparedRequest()
+        p.prepare(
+            method=request.method.upper(),
+            url=url,
+            data=request.body,
+            headers=request.headers,
+        )
+
+        proxies = {}
+        http_proxy = runtime_option.get('httpProxy')
+        https_proxy = runtime_option.get('httpsProxy')
+        no_proxy = runtime_option.get('noProxy')
+
+        if not http_proxy:
+            http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+        if not https_proxy:
+            https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+
+        if http_proxy:
+            proxies['http'] = http_proxy
+        if https_proxy:
+            proxies['https'] = https_proxy
+        if no_proxy:
+            proxies['no_proxy'] = no_proxy
+
+        host = request.headers.get('host')
+        host = host.rstrip('/')
+
+        session_key = f'{request.protocol.lower()}://{host}:{request.port}'
+        session = DaraCore._get_session(session_key=session_key, protocol=request.protocol,
+                                    tls_min_version=tls_min_version, verify=verify)
+        try:
+            resp = session.send(
+                p,
+                proxies=proxies,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                stream=True
+            )
+        except IOError as e:
+            raise RetryError(str(e))
+
+        debug = runtime_option.get('debug') or os.getenv('DEBUG')
+        if debug and debug.lower() == 'sdk':
+            DaraCore._do_http_debug(p, resp)
+
+        end_of_field = re.compile(b'\r\n\r\n|\r\r|\n\n')
+        
+        response = DaraResponse()
+        response.status_message = resp.reason
+        response.status_code = resp.status_code
+        response.headers = {k.lower(): v for k, v in resp.headers.items()}
+        response.response = resp
+        
+        data = b''
+        for chunk in resp.iter_content():
+            match = re.search(end_of_field, chunk)
+            if match:
+                items = re.split(end_of_field, chunk)
+                for index, item in enumerate(items):
+                    data += item
+                    if index != len(items) - 1:
+                        event_resp = DaraResponse()
+                        event_resp.status_code = response.status_code
+                        event_resp.headers = response.headers
+                        event_resp.status_message = response.status_message
+                        event_resp.response = response.response
+                        event_resp.body = data
+                        yield event_resp
+                        data = b''
+            else:
+                data += chunk
+
+        if data:
+            event_resp = DaraResponse()
+            event_resp.status_code = response.status_code
+            event_resp.headers = response.headers
+            event_resp.status_message = response.status_message
+            event_resp.response = response.response
+            event_resp.body = data
+            yield event_resp
 
     @staticmethod
     def get_response_body(resp) -> str:

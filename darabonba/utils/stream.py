@@ -1,6 +1,7 @@
 import json
 import re
 from darabonba.event import Event
+from darabonba.exceptions import DaraException
 from io import BytesIO, StringIO
 from typing import Any, BinaryIO
 
@@ -162,84 +163,84 @@ class Stream:
         return Stream.__to_string(buff)
     
     @staticmethod
-    def read_as_sse(stream):
-        bytes_content = Stream.read_as_bytes(stream)
-        lines = bytes_content.splitlines()
-
-        sse_line_pattern = re.compile(r'^(?P<name>[^:]+): (?P<value>.+)$')
-        current_event = Event()  # Initialize current event
-    
-        for line_item in lines:
-            line = line_item.decode('utf-8')
-
-            if not line.strip() or line.startswith(':'):
-                continue
-            
-            match = sse_line_pattern.match(line)
-            if match:
-                name = match.group('name')
-                value = match.group('value')
-                
-                if name == 'event':
-                    current_event.event = value
-                elif name == 'id':
-                    current_event.id = value
-                elif name == 'data':
-                    current_event.data = value
-                elif name == 'retry':
-                    try:
-                        current_event.retry = int(value)
-                    except ValueError:
-                        pass
-
-                # If data is present, yield the event since data line indicates completion of an event typically
-            if current_event.data is not None:
-                yield {
-                    'id': current_event.id,
-                    'event': current_event.event,
-                    'data': current_event.data
-                }
-                current_event = Event() 
+    def read_as_sse(
+            stream
+    ):
+        for chunk in stream:
+            event = Event()
+            status_code = chunk.get('response').status_code
+            headers = chunk.get('response').headers
+            if 400 <= status_code:
+                decoded_line = chunk.get('stream').decode('utf-8')
+                err = json.loads(decoded_line)
+                err['statusCode'] = status_code
+                raise DaraException({
+                    'code': f"{err.get('Code')}",
+                    'message': f"code: {status_code}, {err.get('Message')} request id: {err.get('RequestId')}",
+                    'data': err,
+                    'description': f"{err.get('Description')}",
+                    'accessDeniedDetail': err.get('AccessDeniedDetail')
+                })
+            for line in chunk.get('stream').splitlines():
+                decoded_line = line.decode('utf-8')
+                if not decoded_line.strip() or decoded_line.startswith(':'):
+                    continue
+                match = sse_line_pattern.match(decoded_line)
+                if match is not None:
+                    name = match.group('name')
+                    value = match.group('value')
+                    if name == 'data':
+                        if event.data:
+                            event.data = '%s\n%s' % (event.data, value)
+                        else:
+                            event.data = value
+                    elif name == 'event':
+                        event.event = value
+                    elif name == 'id':
+                        event.id = value
+                    elif name == 'retry':
+                        event.retry = int(value)
+            yield {'status_code': status_code, 'headers': headers, 'event': event}
 
     @staticmethod
-    async def read_as_sse_async(stream):
-        bytes_content = await Stream.read_as_bytes_async(stream)
-        lines = bytes_content.splitlines()
-
-        sse_line_pattern = re.compile(r'^(?P<name>[^:]+): (?P<value>.+)$')
-        event = Event()
-
-        async for line_item in lines:
-            line = line_item.decode('utf-8')
-
-            if not line.strip() or line.startswith(':'):
-                continue
-            
-            match = sse_line_pattern.match(line)
-            if match:
-                name = match.group('name')
-                value = match.group('value')
-                
-                if name == 'event':
-                    current_event.event = value
-                elif name == 'id':
-                    current_event.id = value
-                elif name == 'data':
-                    current_event.data = value
-                elif name == 'retry':
-                    try:
-                        current_event.retry = int(value)
-                    except ValueError:
-                        pass
-
-                # If data is present, yield the event since data line indicates completion of an event typically
-            if current_event.data is not None:
-                yield {
-                    'id': current_event.id,
-                    'event': current_event.event,
-                    'data': current_event.data
-                }
-                current_event = Event() 
+    async def read_as_sse_async(
+            stream
+    ):
+        async for chunk in stream:
+            event = Event()
+            status_code = chunk.status_code
+            headers = chunk.headers
+            if 400 <= status_code:
+                decoded_line = chunk.body.decode('utf-8')
+                err = json.loads(decoded_line)
+                err['statusCode'] = status_code
+                raise DaraException({
+                    'code': f"{err.get('Code')}",
+                    'message': f"code: {status_code}, {err.get('Message')} request id: {err.get('RequestId')}",
+                    'data': err,
+                    'description': f"{err.get('Description')}",
+                    'accessDeniedDetail': err.get('AccessDeniedDetail')
+                })
+            for line in chunk.body.splitlines():
+                decoded_line = line.decode('utf-8')
+                if not decoded_line.strip() or decoded_line.startswith(':'):
+                    continue
+                match = sse_line_pattern.match(decoded_line)
+                if match is not None:
+                    name = match.group('name')
+                    value = match.group('value')
+                    if name == 'data':
+                        if event.data:
+                            event.data = '%s\n%s' % (event.data, value)
+                        else:
+                            event.data = value
+                    elif name == 'event':
+                        event.event = value
+                    elif name == 'id':
+                        event.id = value
+                    elif name == 'retry':
+                        event.retry = int(value)
+            yield {'status_code': status_code, 'headers': headers, 'event': event}
 
     def read(self, size=None):
         if size is None:

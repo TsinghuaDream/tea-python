@@ -8,10 +8,12 @@ import io
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from requests import PreparedRequest 
 from unittest import mock
+from aioresponses import aioresponses
 from darabonba.core import DaraCore, _TLSAdapter, TLSVersion, _ModelEncoder
 from darabonba.exceptions import RetryError, DaraException
 from darabonba.model import DaraModel
 from darabonba.request import DaraRequest
+from darabonba.response import DaraResponse
 from darabonba.utils.stream import BaseStream
 from darabonba.policy.retry import RetryPolicyContext, RetryOptions, RetryCondition, BackoffPolicy
 
@@ -1203,3 +1205,86 @@ class TestRetry(unittest.TestCase):
         })
         backoffTime = DaraCore.get_backoff_time(option, ctx)
         self.assertEqual(backoffTime, 1000)
+        
+class TestDoSSEAction(unittest.TestCase):
+    
+    def setUp(self):
+        self.request = DaraRequest()
+        self.request.protocol = 'https'
+        self.request.method = 'GET'
+        self.request.pathname = '/events'
+        self.request.headers = {'host': 'example.com'}
+        self.request.port = 443
+        
+        self.runtime_option = {
+            'ignoreSSL': False,
+            'connectTimeout': 5000,
+            'readTimeout': 10000
+        }
+    @mock.patch('darabonba.core.DaraCore.compose_url')
+    @mock.patch('darabonba.core.Session')
+    def test_do_sse_action_sync(self, mock_session, mock_compose_url):
+        mock_compose_url.return_value = 'https://example.com/events'
+        
+        mock_response = mock.MagicMock()
+        mock_response.reason = 'OK'
+        mock_response.status_code = 200
+        mock_response.headers = {'content-type': 'text/event-stream'}
+        
+        sse_data = [
+            b'data: {"message": "hello"}\r\n\r\n',
+            b'data: {"message": "world"}\r\n\r\n',
+        ]
+        mock_response.iter_content.return_value = sse_data
+        
+        mock_session_instance = mock.MagicMock()
+        mock_session_instance.send.return_value = mock_response
+        mock_session.return_value = mock_session_instance
+        
+        result = list(DaraCore.do_sse_action(self.request, self.runtime_option))
+        
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0], DaraResponse)
+        self.assertEqual(result[0].status_code, 200)
+        self.assertEqual(result[0].body, b'data: {"message": "hello"}')
+        self.assertEqual(result[1].body, b'data: {"message": "world"}')
+        
+        mock_compose_url.assert_called_once_with(self.request)
+        mock_session_instance.send.assert_called_once()
+        
+    @mock.patch('your_module.DaraCore.compose_url')
+    async def test_async_do_sse_action_success(self, mock_compose_url):
+        mock_compose_url.return_value = 'https://example.com/events'
+
+        sse_data = [
+            b'data: {"message": "hello"}\r\n\r\n',
+            b'data: {"message": "world"}\r\n\r\n',
+        ]
+
+        with aioresponses() as m:
+            m.get('https://example.com/events', body=sse_data)
+
+            response_generator = DaraCore.async_do_sse_action(self.request)
+
+            results = []
+            async for response in response_generator:
+                results.append(response)
+
+            self.assertEqual(len(results), 2)
+            self.assertIsInstance(results[0], DaraResponse)
+            self.assertEqual(results[0].status_code, 200)
+            self.assertEqual(results[0].body, b'data: {"message": "hello"}')
+            self.assertEqual(results[1].body, b'data: {"message": "world"}')
+
+            mock_compose_url.assert_called_once_with(self.request)
+
+    @mock.patch('your_module.DaraCore.compose_url')
+    async def test_async_do_sse_action_ioerror(self, mock_compose_url):
+        mock_compose_url.return_value = 'https://example.com/events'
+
+        with aioresponses() as m:
+            m.get('https://example.com/events', status=500)
+
+            with self.assertRaises(RetryError):
+                async for _ in DaraCore.async_do_sse_action(self.request):
+                    pass
