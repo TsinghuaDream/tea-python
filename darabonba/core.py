@@ -404,7 +404,7 @@ class DaraCore:
     async def async_do_sse_action(
             request: DaraRequest,
             runtime_option=None
-    ) -> AsyncGenerator[DaraResponse, None]:
+    ) -> DaraResponse:
         runtime_option = runtime_option or {}
 
         url = DaraCore.compose_url(request)
@@ -435,9 +435,7 @@ class DaraCore:
             ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
             ssl_context = DaraCore._set_tls_minimum_version(ssl_context, tls_min_version)
             ssl_context.load_verify_locations(ca_cert)
-            connector = aiohttp.TCPConnector(
-                ssl=ssl_context,
-            )
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
         else:
             verify = False
 
@@ -445,9 +443,7 @@ class DaraCore:
             sock_read=read_timeout,
             sock_connect=connect_timeout
         )
-        
-        end_of_field = re.compile(b'\r\n\r\n|\r\r|\n\n')
-        
+
         async with aiohttp.ClientSession(connector=connector) as s:
             body = b''
             if isinstance(request.body, BaseStream):
@@ -457,52 +453,34 @@ class DaraCore:
                 body = request.body.encode('utf-8')
             else:
                 body = request.body
-                
+
             try:
                 async with s.request(request.method, url,
                                     data=body,
                                     headers=request.headers,
                                     ssl=verify,
                                     proxy=proxy,
-                                    timeout=timeout) as response:
-                    
+                                    timeout=timeout,
+                                    ) as response:
+
+                    # 检查响应状态码
+                    if response.status < 200 or response.status >= 300:
+                        raise Exception(f"HTTP error: {response.status} {response.reason}")
+
+                    # 创建DaraResponse，但不处理 content
                     base_resp = DaraResponse()
                     base_resp.headers = {k.lower(): v for k, v in response.headers.items()}
                     base_resp.status_code = response.status
                     base_resp.status_message = response.reason
-                    base_resp.response = response
                     
-                    data = b''
-                    async for chunk in response.content.iter_any():
-                        match = re.search(end_of_field, chunk)
-                        if match:
-                            items = re.split(end_of_field, chunk)
-                            for index, item in enumerate(items):
-                                data += item
-                                if index != len(items) - 1:
-                                    event_resp = DaraResponse()
-                                    event_resp.status_code = base_resp.status_code
-                                    event_resp.headers = base_resp.headers
-                                    event_resp.status_message = base_resp.status_message
-                                    event_resp.response = base_resp.response
-                                    event_resp.body = data
-                                    yield event_resp
-                                    data = b''
-                        else:
-                            data += chunk
-                    
-                    if data:
-                        event_resp = DaraResponse()
-                        event_resp.status_code = base_resp.status_code
-                        event_resp.headers = base_resp.headers
-                        event_resp.status_message = base_resp.status_message
-                        event_resp.response = base_resp.response
-                        event_resp.body = data
-                        yield event_resp
-                        
-            except IOError as e:
-                raise RetryError(str(e))
+                    # 将 response.content 作为流返回
+                    base_resp.body = response.content  # 保持流的异步特性
 
+                    return base_resp  # 返回响应对象
+
+            except (aiohttp.ClientError, Exception) as e:
+                print(f"Request failed: {e}")
+                raise
     @staticmethod
     def do_sse_action(
             request: DaraRequest,
